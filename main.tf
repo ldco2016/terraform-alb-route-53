@@ -2,6 +2,17 @@
 # 1. NETWORKING INFRASTRUCTURE (VPC)
 # ==========================================
 
+// Input variables
+variable "hosted_zone_id" {
+    description = "Route53 Hosted Zone ID"
+    type        = string
+}
+
+variable "domain_name" {
+    description = "Domain or subdomain for the Route53 record (e.g. app.example.com)"
+    type        = string
+}
+
 resource "aws_vpc" "lab_vpc" {
     cidr_block = "10.0.0.0/16"
     enable_dns_hostnames = true
@@ -163,5 +174,79 @@ resource "aws_lb_target_group" "alb-tg" {
       port = "80"
       protocol = "HTTP"
       healthy_threshold = 2
+      unhealthy_threshold = 2
+        timeout = 3
+        interval = 30
+    }
+}
+
+resource "aws_lb_listener" "http" {
+    load_balancer_arn = aws_lb.lab_alb.arn
+    port = 80
+    protocol = "HTTP"
+
+    default_action {
+        type = "forward"
+        target_group_arn = aws_lb_target_group.alb-tg.arn
+    }
+}
+
+resource "aws_lb_target_group_attachment" "attach_a" {
+    target_group_arn = aws_lb_target_group.alb-tg.arn
+    target_id = aws_instance.server_a.id
+    port = 80
+}
+
+resource "aws_lb_target_group_attachment" "attach_b" {
+    target_group_arn = aws_lb_target_group.alb-tg.arn
+    target_id = aws_instance.server_b.id
+    port = 80
+}
+
+# ==========================================
+# ADVANCED OBSERVABILITY & FAILOVER (CLOUDWATCH)
+# ==========================================
+
+# 1. CloudWatch Alarm monitoring high CPU as a proxy for an unhealthy app
+resource "aws_cloudwatch_metric_alarm" "server_a_cpu_alarm" {
+    alarm_name = "server-a-cpu-exhaustion"
+    comparison_operator = "GreaterThanOrEqualToThreshold"
+    evaluation_periods = "1"
+    metric_name = "CPUUtilization"
+    namespace = "AWS/EC2"
+    period = "300" # 5 minutes (Free Tier friendly)
+    statistic = "Average"
+    threshold = 80
+    alarm_description = "This metric monitors EC2 CPU utilization for primary web stack"
+    dimensions = {
+        InstanceId = aws_instance.server_a.id
+    }
+}
+
+# 2. Route53 Health Check that monitors the CloudWatch Alarm 
+resource "aws_route53_health_check" "cloudwatch_health_check" {
+   type = "CLOUDWATCH_METRIC"
+    cloudwatch_alarm_name = aws_cloudwatch_metric_alarm.server_a_cpu_alarm.alarm_name
+    cloudwatch_alarm_region = "us-east-1"
+    insufficient_data_health_status = "Healthy"
+}
+
+# 3. Update your Route 53 Record to tie into this health check
+resource "aws_route53_record" "weighted_alb" {
+    zone_id = var.hosted_zone_id # Replace with your actual hosted zone ID
+    name = var.domain_name # Replace with your desired subdomain
+    type = "A"
+    
+    weighted_routing_policy {
+        weight = 50
+    }
+
+    set_identifier = "alb-primary-target"
+    health_check_id = aws_route53_health_check.cloudwatch_health_check.id # <--- Ties DR to CloudWatch
+
+    alias {
+        name = aws_lb.lab_alb.dns_name
+        zone_id = aws_lb.lab_alb.zone_id
+        evaluate_target_health = true
     }
 }
